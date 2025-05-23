@@ -4,15 +4,23 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const serviceAccount = require('./serviceAccountKey.json');
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+// ***************************************************************
+// ** การแก้ไขที่สำคัญ: ลบการเรียกใช้ serviceAccountKey.json โดยตรง **
+// ** Firebase Admin SDK จะโหลดข้อมูลรับรองจาก GOOGLE_APPLICATION_CREDENTIALS environment variable โดยอัตโนมัติ **
+// ***************************************************************
+admin.initializeApp();
 
 const db = admin.firestore();
 
-const LINE_TOKEN = process.env.LINE_TOKEN || 'fapUjcRTdRNa4kivEv+lp41nTcw+wXXJYPWvoyQjqwifE2z/9yR69lwOKs8Q4c13UAWq9/7D5+Y/6ps/5e6BNU6VOgLHEezr1LXN/ovvibm1CpNPHbzcvEbcGXBXyu1JRKcP/tilej2lFxjgGg8RIgdB04t89/1O/w1cDnyilFU=';
+// LINE_TOKEN ควรถูกดึงมาจาก Environment Variable เพื่อความปลอดภัย
+const LINE_TOKEN = process.env.LINE_TOKEN; 
+
+// ตรวจสอบว่า LINE_TOKEN มีค่าหรือไม่ (สำหรับการทำงานใน Production)
+if (!LINE_TOKEN) {
+  console.error('LINE_TOKEN environment variable is not set. LINE messages will not work correctly.');
+  // ใน Production คุณอาจจะต้องการให้แอปพลิเคชันหยุดทำงานหรือแจ้งเตือนเมื่อไม่มี LINE_TOKEN
+}
+
 
 const FEATURES = {
   THEMED_CARDS: true,
@@ -21,7 +29,6 @@ const FEATURES = {
   QUICK_REPLY: true
 };
 
-// ดึง courses ที่เปิดสอนจาก Firestore
 // ดึง courses ที่เปิดสอนจาก Firestore
 async function getOpenCourses() {
   const courses = [];
@@ -47,7 +54,8 @@ async function getOpenCourses() {
     });
     console.log('Filtered courses:', courses.length);
   } catch (error) {
-    console.error('Error fetching courses from Firestore:', error);
+    // แสดง Error code และรายละเอียดเพื่อการ Debug ที่ดีขึ้น
+    console.error('Error fetching courses from Firestore:', error.code, error.details || error.message);
   }
   return courses;
 }
@@ -78,26 +86,48 @@ async function handleEvent(event) {
     return;
   }
 
-  if (userMessage.includes('หมวดหมู่')) {
-    const category = userMessage.split('หมวดหมู่')[1].trim();
-    const filtered = courses.filter(c => (c.category || '').toLowerCase().includes(category));
-    if (filtered.length > 0) {
-      await sendCoursesFlexInChunks(replyToken, filtered);
+  // ปรับปรุงการค้นหาหมวดหมู่ให้ยืดหยุ่นขึ้น
+  if (FEATURES.CATEGORY_SEARCH && userMessage.startsWith('หมวดหมู่')) {
+    const parts = userMessage.split(' ');
+    if (parts.length > 1) {
+      const category = parts.slice(1).join(' ').trim(); // รวมคำที่เหลือเป็นหมวดหมู่
+      const filtered = courses.filter(c => (c.category || '').toLowerCase().includes(category));
+      if (filtered.length > 0) {
+        await sendCoursesFlexInChunks(replyToken, filtered);
+      } else {
+        await sendTextReply(replyToken, `ไม่พบคอร์สในหมวดหมู่ "${category}"`);
+      }
     } else {
-      await sendTextReply(replyToken, `ไม่พบคอร์สในหมวดหมู่ "${category}"`);
+        await sendTextReply(replyToken, 'กรุณาระบุหมวดหมู่ที่ต้องการค้นหา เช่น "หมวดหมู่ เบเกอรี่"');
     }
     return;
   }
-
-  const matchedCourses = courses.filter(c =>
-    (c.keyword || '').split(',').some(k => fuzzyMatch(userMessage, k)) ||
-    fuzzyMatch(userMessage, c.title.toLowerCase())
-  );
+  
+  // ใช้ fuzzy search ถ้าเปิดใช้งาน FEATURE นี้
+  let matchedCourses = [];
+  if (FEATURES.FUZZY_SEARCH) {
+    matchedCourses = courses.filter(c =>
+      (c.keyword || '').split(',').some(k => fuzzyMatch(userMessage, k)) ||
+      fuzzyMatch(userMessage, c.title.toLowerCase())
+    );
+  } else {
+    // Fallback to exact match if fuzzy search is disabled
+    matchedCourses = courses.filter(c =>
+      (c.keyword || '').toLowerCase().includes(userMessage) ||
+      c.title.toLowerCase().includes(userMessage)
+    );
+  }
+  
 
   if (matchedCourses.length > 0) {
     await sendCoursesFlexInChunks(replyToken, matchedCourses);
   } else {
-    await sendTextWithQuickReply(replyToken, 'ไม่พบคอร์สที่เกี่ยวข้อง ลองเลือกจากเมนูด้านล่างนะคะ 👇');
+    // ใช้ quick reply ถ้าเปิดใช้งาน FEATURE นี้
+    if (FEATURES.QUICK_REPLY) {
+      await sendTextWithQuickReply(replyToken, 'ไม่พบคอร์สที่เกี่ยวข้อง ลองเลือกจากเมนูด้านล่างนะคะ 👇');
+    } else {
+      await sendTextReply(replyToken, 'ไม่พบคอร์สที่เกี่ยวข้องค่ะ');
+    }
   }
 }
 
@@ -125,7 +155,7 @@ async function sendCoursesFlexInChunks(replyToken, courses) {
       }
     };
     await replyMessage(replyToken, message);
-    if (i < chunks.length - 1) await delay(1000); // ป้องกัน rate-limit
+    if (i < chunks.length - 1) await delay(1000); // ป้องกัน rate-limit ของ LINE API
   }
 }
 
@@ -155,7 +185,7 @@ function createFlexCard(course) {
           text: course.title,
           weight: 'bold',
           size: 'xl',
-          color: FEATURES.THEMED_CARDS ? '#C1440E' : '#000000',
+          color: FEATURES.THEMED_CARDS ? '#C1440E' : '#000000', // ใช้สีตาม Feature flag
           wrap: true
         },
         {
@@ -208,6 +238,10 @@ function createFlexCard(course) {
 
 // ฟังก์ชันส่งข้อความแบบ reply
 function replyMessage(replyToken, message) {
+  if (!LINE_TOKEN) {
+    console.warn('LINE_TOKEN is not set. Cannot send reply message.');
+    return Promise.resolve(); // ป้องกันไม่ให้แอปพลิเคชัน Crash
+  }
   return axios.post(
     'https://api.line.me/v2/bot/message/reply',
     {
@@ -263,10 +297,10 @@ app.get('/test-courses', async (req, res) => {
 
 // Route หน้าแรกทดสอบ
 app.get('/', (req, res) => {
-  res.send('Hello from Glitch! Server is running.');
+  res.send('Hello from your LINE Bot backend! Server is running.');
 });
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000; // กำหนดค่า default port หากไม่ถูกตั้งใน env
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
